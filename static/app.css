@@ -39,3 +39,10 @@
 .error-note{margin-top:10px;color:var(--red);font-size:12px;overflow-wrap:anywhere}.remote-link{color:var(--teal)}#folderList{max-height:42vh;overflow:auto;margin-top:12px}.pill.failed,.pill.waiting_auth,.pill.expired{color:var(--red);background:#f8e8e5}[data-theme="dark"] .pill.failed,[data-theme="dark"] .pill.waiting_auth,[data-theme="dark"] .pill.expired{background:#432e31}.pill.verifying{color:var(--teal);background:var(--pale)}
 
 .drop-actions{display:flex;justify-content:center;gap:10px}.folder-summary{font-size:12px;color:var(--muted);margin:10px 0;line-height:1.8}.current-item{overflow-wrap:anywhere}.manifest-list{max-height:50vh;overflow:auto;min-width:280px}.manifest-row{padding:10px 0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:5px;overflow-wrap:anywhere}.manifest-row small{color:var(--muted)}#manifestDialog{width:min(680px,90vw)}.pill.scanning,.pill.scan_queued{color:var(--teal);background:var(--pale)}
+
+.queue-toolbar{flex-wrap:wrap}.segmented,.toolbar-actions{flex-wrap:wrap}
+#tasks{height:clamp(320px,55vh,600px);overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:var(--muted) transparent}
+#tasks:focus-visible{outline:2px solid var(--teal);outline-offset:-2px}
+#tasks::-webkit-scrollbar{width:8px}#tasks::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+.queue-footnote{border-top:1px solid var(--line);padding:9px 16px;font-size:11px;color:var(--muted)}
+#hiddenCount{font-size:10px;font-variant-numeric:tabular-nums}

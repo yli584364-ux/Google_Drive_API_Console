@@ -13,6 +13,7 @@ from .storage import AppError
 
 ACTIVE = {'scan_queued', 'scanning', 'queued', 'preparing', 'uploading', 'waiting_retry', 'pausing', 'cancelling', 'verifying'}
 TERMINAL = {'completed', 'cancelled'}
+RECOVERABLE = ACTIVE - {'pausing', 'cancelling'}
 
 
 def canonical(value):
@@ -120,14 +121,41 @@ class Engine:
         # the action path's engine->auth lock order).
         return any(j['state'] in ACTIVE for j in self.store.jobs())
     def start(self):
-        for j in self.store.jobs():
-            if j['state'] in ACTIVE:
-                self.update(j['id'], state='paused', error='后台曾退出；点击继续将查询云端进度。')
+        automatic = self.store.setting('auto_resume', True)
+        # Recover interrupted transfers before files that were only queued.
+        for j in sorted(self.store.jobs(), key=lambda x: x['state'] in ('queued','scan_queued')):
+            state = j['state']; identity = j['id']
+            if state == 'cancelling':
+                self.update(identity, state='cancelled', next_retry_at=None); continue
+            if state == 'pausing':
+                self.update(identity, state='paused', resume_on_start=False, next_retry_at=None); continue
+            interrupted = state in RECOVERABLE or (state=='paused' and j.get('resume_on_start'))
+            if not interrupted or j.get('archived'): continue
+            if not automatic:
+                self.update(identity, state='paused', resume_on_start=True, next_retry_at=None,
+                    error='进度已恢复；启动自动续传已关闭，点击继续即可。')
+                continue
+            try:
+                current = self.auth.identity()
+                if current != {'email': j['account'], 'client_id': j['client_id']}:
+                    raise AppError('任务账号或客户端与当前授权不同。')
+            except AppError as exc:
+                self.update(identity, state='waiting_auth', error='自动恢复等待授权：'+str(exc)); continue
+            try:
+                self.files.assert_job(j)
+            except (AppError, OSError):
+                self.update(identity, state='failed', error='自动恢复停止：源文件不可访问或已变化，请核对原路径。'); continue
+            self.update(identity, state='scan_queued' if j.get('kind')=='folder' and not j['scanned'] else 'queued',
+                resume_on_start=True, error=None, next_retry_at=None)
+            self.store.event('已恢复中断任务；上传前将查询 Google 已确认的位置。', identity)
         self.thread = threading.Thread(target=self.schedule, name='upload-scheduler', daemon=True)
         self.thread.start()
     def stop(self):
-        self.shutdown_event.set(); self.wake.set()
         with self.lock:
+            self.shutdown_event.set(); self.wake.set()
+            for job in self.store.jobs():
+                if job['state'] in RECOVERABLE:
+                    self.update(job['id'], resume_on_start=True)
             for c in list(self.controls.values()): c.set()
         if self.thread: self.thread.join(timeout=3)
         self.pool.shutdown(wait=True)
@@ -154,6 +182,8 @@ class Engine:
             # A worker progress response must not overwrite a just-requested control state.
             if job['state'] in ('pausing', 'cancelling') and changes.get('state') in ('uploading', 'waiting_retry', 'preparing'):
                 changes.pop('state')
+            if changes.get('state') in TERMINAL | {'staged','failed','waiting_auth','expired'}:
+                changes['resume_on_start'] = False
             previous_confirmed = job['confirmed']; previous_state = job['state']
             job.update(changes); job['updated_at'] = time.time()
             self.store.put('jobs', job); self.seq += 1
@@ -176,11 +206,11 @@ class Engine:
         self.files.assert_job(source)
         with self.lock:
             for old in self.store.jobs():
-                if old.get('file_id') == file_id and old['folder_id'] == folder['id'] and old['account'] == identity['email'] and old['state'] != 'cancelled':
+                if not old.get('archived') and old.get('file_id') == file_id and old['folder_id'] == folder['id'] and old['account'] == identity['email'] and old['state'] != 'cancelled':
                     return old
             job = {**source, 'id': uuid.uuid4().hex, 'file_id': file_id, 'folder_id': folder['id'],
                 'folder_name': folder['name'], 'account': identity['email'], 'client_id': identity['client_id'],
-                'state': 'staged', 'confirmed': 0, 'hash_bytes': 0, 'chunk_mib': chunk_mib,
+                'state': 'staged', 'resume_on_start': False, 'confirmed': 0, 'hash_bytes': 0, 'chunk_mib': chunk_mib,
                 'retry_count': 0, 'next_retry_at': None, 'remote_id': None, 'remote_url': None,
                 'md5': None, 'sha256': None, 'error': None, 'created_at': time.time(), 'updated_at': time.time()}
             self.store.put('jobs', job); self.store.event('文件已加入队列。', job['id']); self.seq += 1
@@ -194,7 +224,7 @@ class Engine:
                     return old
             job = {**source, 'id': uuid.uuid4().hex, 'kind': 'folder', 'folder_id': folder['id'],
                 'folder_name': folder['name'], 'account': account['email'], 'client_id': account['client_id'],
-                'state': 'scan_queued', 'scanned': False, 'file_count': 0, 'directory_count': 0,
+                'state': 'scan_queued', 'resume_on_start': False, 'scanned': False, 'file_count': 0, 'directory_count': 0,
                 'completed_files': 0, 'size': 0, 'confirmed': 0, 'hash_bytes': 0, 'chunk_mib': chunk_mib,
                 'retry_count': 0, 'next_retry_at': None, 'remote_id': None, 'remote_url': None,
                 'error': None, 'created_at': time.time(), 'updated_at': time.time()}
@@ -203,6 +233,14 @@ class Engine:
     def action(self, identity, action):
         with self.lock:
             j = self.store.get('jobs', identity); state = j['state']
+            if action in ('archive', 'restore'):
+                if j.get('parent_id'):
+                    raise AppError('请通过所属文件夹任务管理历史记录。')
+                if state not in TERMINAL:
+                    raise AppError('只能隐藏已完成或已取消的记录；待处理任务请先取消。', 'state_conflict', 409)
+                j = self.update(identity, archived=action=='archive')
+                self.store.event('记录已隐藏，可在“已隐藏”页恢复。' if action=='archive' else '记录已恢复显示。', identity)
+                return j
             if action == 'resume':
                 if state in ('scan_queued', 'scanning', 'queued', 'preparing', 'uploading', 'waiting_retry', 'verifying'): return j
                 # Scanning publishes its staged result before its future exits.
@@ -217,14 +255,15 @@ class Engine:
                 if current != {'email': j['account'], 'client_id': j['client_id']}:
                     raise AppError('任务绑定的 Google 账号或客户端与当前授权不同。')
                 self.files.assert_job(j)
-                j = self.update(identity, state='scan_queued' if j.get('kind')=='folder' and not j['scanned'] else 'queued', error=None, next_retry_at=None)
+                j = self.update(identity, state='scan_queued' if j.get('kind')=='folder' and not j['scanned'] else 'queued', resume_on_start=True, error=None, next_retry_at=None)
             elif action == 'pause':
-                if state in TERMINAL or state in ('paused', 'expired', 'failed', 'waiting_auth', 'staged'): return j
-                j = self.update(identity, state='pausing' if identity in self.running else 'paused', next_retry_at=None)
+                if state in TERMINAL or state in ('paused', 'expired', 'failed', 'waiting_auth', 'staged'):
+                    return self.update(identity, resume_on_start=False)
+                j = self.update(identity, state='pausing' if identity in self.running else 'paused', resume_on_start=False, next_retry_at=None)
                 if identity in self.controls: self.controls[identity].set()
             elif action == 'cancel':
                 if state in TERMINAL: return j
-                j = self.update(identity, state='cancelling' if identity in self.running else 'cancelled', next_retry_at=None)
+                j = self.update(identity, state='cancelling' if identity in self.running else 'cancelled', resume_on_start=False, next_retry_at=None)
                 if identity in self.controls: self.controls[identity].set()
             elif action == 'restart':
                 if state != 'expired' or identity in self.running:
@@ -243,6 +282,13 @@ class Engine:
             self.store.event({'resume':'已请求开始/继续。','pause':'已请求暂停。','cancel':'已请求取消；不会删除源文件。'}[action], identity)
             self.wake.set()
             return j
+    def archive_finished(self):
+        with self.lock:
+            count = 0
+            for job in self.store.jobs():
+                if job['state'] in TERMINAL and not job.get('archived'):
+                    self.action(job['id'], 'archive'); count += 1
+            return {'count': count}
     def control(self, identity):
         j = self.store.get('jobs', identity)
         parent = self.store.get('jobs', j['parent_id']) if j.get('parent_id') else j

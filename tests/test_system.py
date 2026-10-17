@@ -179,9 +179,86 @@ def test_retry_wait_is_interruptible_by_cancel(rig):
 
 
 def test_startup_marks_crashed_upload_paused_without_auto_resume(rig):
+    rig.store.set_setting('auto_resume',False)
     rig.engine.update(rig.job['id'],state='uploading',confirmed=262144)
     rig.engine.start();j=wait_state(rig,{'paused'})
     assert j['confirmed']==262144 and not rig.remote.offsets
+
+
+def test_crash_recovery_uses_google_offset_ahead_of_saved_progress(rig):
+    r=rig
+    r.remote.data=r.data[:131072]
+    r.remote.job=r.job
+    r.engine.update(r.job['id'],state='uploading',confirmed=65536,remote_id='remote-id')
+    r.vault.put('session-'+r.job['id'],{'uri':'https://www.googleapis.com/upload/test'})
+    r.engine.start()
+    done=wait_state(r,{'completed'})
+    assert r.remote.offsets[0]==131072 and r.remote.init_count==0
+    assert r.remote.data==r.data and done['confirmed']==len(r.data)
+    assert done['resume_on_start'] is False
+
+
+def test_normal_backend_stop_then_start_resumes_without_manual_action(rig):
+    r=rig;r.remote.mode='blocked';run(r);assert r.remote.entered.wait(5)
+    stopping=threading.Thread(target=r.engine.stop);stopping.start()
+    assert r.engine.shutdown_event.wait(2)
+    r.remote.release.set();stopping.join(5);assert not stopping.is_alive()
+    saved=r.store.get('jobs',r.job['id'])
+    assert saved['state']=='paused' and saved['resume_on_start'] is True
+    r.engine=Engine(r.store,r.vault,r.auth,r.files,r.remote.factory,.001)
+    r.engine.start();wait_state(r,{'completed'})
+    assert r.remote.init_count==1 and r.remote.offsets==[0,1048576,2097152]
+
+
+@pytest.mark.parametrize('state',['staged','paused','cancelled','completed','failed','waiting_auth','expired'])
+def test_start_does_not_resume_tasks_without_running_intent(rig,state):
+    r=rig;r.engine.update(r.job['id'],state=state,resume_on_start=False)
+    r.engine.start()
+    assert r.store.get('jobs',r.job['id'])['state']==state and not r.remote.offsets
+
+
+@pytest.mark.parametrize('state,expected',[('pausing','paused'),('cancelling','cancelled')])
+def test_restart_finishes_pending_user_pause_or_cancel_without_upload(rig,state,expected):
+    r=rig;r.engine.update(r.job['id'],state=state,resume_on_start=True)
+    r.engine.start();saved=r.store.get('jobs',r.job['id'])
+    assert saved['state']==expected and saved['resume_on_start'] is False
+    assert not r.remote.offsets
+
+
+def test_automatic_recovery_refuses_modified_source(rig):
+    r=rig;r.engine.update(r.job['id'],state='uploading',resume_on_start=True)
+    r.path.write_bytes(b'changed since previous startup')
+    r.engine.start();saved=wait_state(r,{'failed'})
+    assert '源文件' in saved['error'] and not r.remote.offsets
+
+
+def test_automatic_recovery_waits_when_account_changes(rig):
+    r=rig;r.engine.update(r.job['id'],state='uploading',resume_on_start=True)
+    r.auth.identity=lambda:{'email':'different@example.com','client_id':'test-client'}
+    r.engine.start();saved=wait_state(r,{'waiting_auth'})
+    assert not saved['resume_on_start'] and not r.remote.offsets
+
+
+def test_automatic_recovery_does_not_restart_expired_session(rig):
+    r=rig;r.engine.update(r.job['id'],state='uploading',remote_id='remote-id',resume_on_start=True)
+    r.vault.put('session-'+r.job['id'],{'uri':'https://www.googleapis.com/upload/test'})
+    r.remote.expired=True;r.engine.start();saved=wait_state(r,{'expired'})
+    assert not saved['resume_on_start'] and not r.remote.offsets and r.remote.init_count==0
+
+
+def test_auto_resume_setting_is_persistent_and_has_csrf_protection(tmp_path):
+    data=tmp_path/'data'
+    for initial in [True,False]:
+        app=create_app(data,auth_factory=FakeAuth,lock_instance=False)
+        with TestClient(app,base_url='http://127.0.0.1:8787') as client:
+            boot=client.get('/api/bootstrap').json()
+            assert boot['auto_resume'] is initial
+            assert app.state.store.db.execute('PRAGMA synchronous').fetchone()[0]==2
+            if initial:
+                body={'concurrency':1,'auto_resume':False}
+                assert client.put('/api/settings/tuning',json=body).status_code==403
+                changed=client.put('/api/settings/tuning',json=body,headers={'X-CSRF-Token':boot['csrf']})
+                assert changed.json()['auto_resume'] is False
 
 
 def test_repeated_chunk_failures_are_bounded(rig):
@@ -297,3 +374,55 @@ def test_stop_service_requires_csrf_and_requests_graceful_shutdown(tmp_path):
         assert not called
         assert client.post('/api/service/stop',json={},headers={'X-CSRF-Token':csrf}).status_code==202
         assert called==[True]
+
+
+def test_hide_restore_preserves_cancelled_progress_sessions_and_source(rig):
+    r=rig;identity=r.job['id']
+    r.engine.update(identity,confirmed=262144)
+    r.vault.put('session-'+identity,{'uri':'https://www.googleapis.com/upload/test'})
+    r.engine.action(identity,'cancel')
+    hidden=r.engine.action(identity,'archive')
+    assert hidden['archived'] is True and hidden['state']=='cancelled'
+    reopened=Store(r.store.db.execute('PRAGMA database_list').fetchone()[2])
+    assert reopened.get('jobs',identity)['archived'] is True
+    restored=r.engine.action(identity,'restore')
+    assert restored['archived'] is False and restored['state']=='cancelled'
+    assert restored['confirmed']==262144
+    assert r.vault.get('session-'+identity)['uri'].endswith('/test')
+    assert r.path.read_bytes()==r.data and not r.remote.offsets
+
+
+@pytest.mark.parametrize('state',['staged','paused','queued','uploading','failed'])
+def test_unfinished_tasks_cannot_be_hidden(rig,state):
+    rig.engine.update(rig.job['id'],state=state)
+    with pytest.raises(AppError,match='只能隐藏'):
+        rig.engine.action(rig.job['id'],'archive')
+    assert rig.store.get('jobs',rig.job['id'])['state']==state
+
+
+def test_bulk_hide_only_finished_and_new_upload_does_not_reuse_hidden_completed(rig):
+    r=rig;r.engine.update(r.job['id'],state='completed')
+    for identity,state in [('queued-test','queued'),('cancelled-test','cancelled'),('staged-test','staged')]:
+        r.store.put('jobs',{**r.job,'id':identity,'state':state})
+    assert r.engine.archive_finished()=={'count':2}
+    assert r.engine.archive_finished()=={'count':0}
+    assert not r.store.get('jobs','queued-test').get('archived')
+    assert not r.store.get('jobs','staged-test').get('archived')
+    # Remove the nonterminal duplicates from this fixture's identity search.
+    for identity in ['queued-test','staged-test']:
+        r.engine.update(identity,file_id='other-file')
+    new=r.engine.create(r.job['file_id'],{'id':'folder1','name':'目标目录'},8)
+    assert new['id']!=r.job['id'] and new['state']=='staged' and not new.get('archived')
+
+
+def test_history_api_requires_csrf_and_restore_does_not_resume(tmp_path):
+    app=create_app(tmp_path/'data',auth_factory=FakeAuth,lock_instance=False)
+    with TestClient(app,base_url='http://127.0.0.1:8787') as client:
+        csrf=client.get('/api/bootstrap').json()['csrf'];headers={'X-CSRF-Token':csrf}
+        app.state.store.put('jobs',{'id':'old-job','state':'cancelled','size':10,'confirmed':0})
+        assert client.post('/api/history/archive',json={}).status_code==403
+        assert client.post('/api/history/archive',json={},headers=headers).json()=={'count':1}
+        assert client.get('/api/jobs').json()['jobs'][0]['archived'] is True
+        restored=client.post('/api/jobs/old-job/restore',json={},headers=headers)
+        assert restored.status_code==202
+        assert restored.json()['state']=='cancelled' and restored.json()['archived'] is False

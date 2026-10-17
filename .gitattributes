@@ -5,4 +5,5 @@
 *.html text eol=lf
 *.css text eol=lf
 *.md text eol=lf
-*.cmd text eol=crlf
+# Preserve CRLF bytes in clones and source ZIP downloads.
+*.cmd -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

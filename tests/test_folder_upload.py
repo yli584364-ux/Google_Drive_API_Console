@@ -168,6 +168,21 @@ def test_folder_pause_restart_service_resume_keeps_session_and_directories(tree)
     assert len(tree['remote'].dirs)==4
 
 
+def test_folder_backend_stop_then_start_automatically_restores_current_child(tree):
+    job, remote = block_folder(tree)
+    stopping = threading.Thread(target=tree['engine'].stop); stopping.start()
+    assert tree['engine'].shutdown_event.wait(2)
+    remote.release.set(); stopping.join(5); assert not stopping.is_alive()
+    saved = tree['store'].get('jobs', job['id'])
+    assert saved['state']=='paused' and saved['resume_on_start'] is True
+    engine = Engine(tree['store'], tree['vault'], tree['auth'], tree['files'], tree['remote'].factory, .001)
+    tree['engine'] = engine; engine.start()
+    done = wait(tree['store'], job['id'], {'completed','failed'})
+    assert done['state']=='completed', done
+    assert remote.offsets==[0,1048576,2097152] and len(tree['remote'].files)==1
+    assert len(tree['remote'].dirs)==4 and done['confirmed']==done['size']
+
+
 def test_folder_cancel_stops_remaining_files_without_deleting(tree):
     job, remote = block_folder(tree)
     tree['engine'].action(job['id'], 'cancel'); remote.release.set()

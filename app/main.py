@@ -50,6 +50,7 @@ class NewFolderJob(BaseModel):
     chunk_mib: int = Field(default=8, ge=1, le=64)
 class Tuning(BaseModel):
     concurrency: int = Field(ge=1, le=2)
+    auto_resume: bool | None = None
 
 
 def create_app(data_dir=None, origin='http://127.0.0.1:8787', auth_factory=AuthManager, drive_factory=Drive, lock_instance=True):
@@ -116,6 +117,7 @@ def create_app(data_dir=None, origin='http://127.0.0.1:8787', auth_factory=AuthM
     def bootstrap():
         response = JSONResponse({'csrf': csrf, 'credential_path': auth.config_path, 'auth':auth.status(),
             'sources':store.sources(), 'concurrency':store.setting('concurrency', 1),
+            'auto_resume':store.setting('auto_resume', True),
             'last_source':store.setting('last_source', None),
             'target':store.setting('target', None), **engine.snapshot()})
         response.set_cookie('drive_session', csrf, httponly=True, samesite='strict', path='/')
@@ -126,8 +128,10 @@ def create_app(data_dir=None, origin='http://127.0.0.1:8787', auth_factory=AuthM
 
     @app.put('/api/settings/tuning')
     def tuning(body: Tuning):
-        store.set_setting('concurrency', body.concurrency); engine.wake.set()
-        return {'concurrency':body.concurrency}
+        store.set_setting('concurrency', body.concurrency)
+        if body.auto_resume is not None: store.set_setting('auto_resume', body.auto_resume)
+        engine.wake.set()
+        return {'concurrency':body.concurrency, 'auto_resume':store.setting('auto_resume', True)}
 
     @app.post('/api/auth/start')
     def auth_start(): return auth.start()
@@ -169,6 +173,9 @@ def create_app(data_dir=None, origin='http://127.0.0.1:8787', auth_factory=AuthM
 
     @app.get('/api/jobs')
     def get_jobs(): return engine.snapshot()
+
+    @app.post('/api/history/archive')
+    def archive_history(): return engine.archive_finished()
 
     @app.post('/api/folder-jobs')
     def new_folder_job(body: NewFolderJob):

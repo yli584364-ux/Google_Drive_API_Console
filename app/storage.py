@@ -60,7 +60,9 @@ class Vault:
         with self.lock:
             p = self.path(key)
             tmp = p.with_suffix('.tmp')
-            tmp.write_bytes(protect(json.dumps(value).encode()))
+            with tmp.open('wb') as stream:
+                stream.write(protect(json.dumps(value).encode()))
+                stream.flush(); os.fsync(stream.fileno())
             os.replace(tmp, p)
 
 
@@ -70,6 +72,7 @@ class Store:
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA synchronous=FULL')
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, path TEXT UNIQUE NOT NULL);
